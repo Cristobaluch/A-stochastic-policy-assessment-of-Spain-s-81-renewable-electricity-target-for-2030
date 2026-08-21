@@ -1,0 +1,554 @@
+# This script provides the auxiliary functions needed to make the Monte Carlo framework and the model work
+
+# In particular, defines the following functions:
+
+# 1. sample_time_window to select (a) the 7-day window and baseline year or (b) only baseline year of the dataset to be projected
+# 2. build_deltas_dictionary to create a dictionary of the projection estimates and weights to each variable (run once)
+# 3. sampling_procedure defines the sampling procedure for the projection  stimates
+# 4. sample_deltas applies the sampling procedure to get a dictionary of draws for each iteration
+# 5. apply_deltas! projects the sampled_window_data to 2030 by applying the delta draws
+# 6. compute_iteration_params to define some parameters specific to each iteration hat are passed to the model
+# 7. calculate_period_averages computes averages to retrieve hourly or monthly profiles of a selection of variables
+# 8. store_results! stores all the results from each iteration into different pre-defined containers
+
+
+
+# ===== 1. Auxiliary function to sample a time window =====
+# Instead of solving for an entire year, we solve for a randomly selected 7-day window each month.
+# The idea is to randomly select a "mould" of historical data, which is then projected.
+# This process ensures more variability on our moulds, so more robustness of results.
+# This function creates the mentioned "mould" from historical data, which we call sampled_window_data.
+
+# ===== 1. A) Sample 7-day x 12 months time window for a baseline year =====
+
+function sample_time_window(
+    historical_data::DataFrame,
+    baseline_years::Vector{Int}
+    )
+
+    year = rand(baseline_years)
+    day_start = rand(1:21)
+
+    sampled_window_data = filter(row ->
+        row.year == year &&
+        row.day >= day_start &&
+        row.day < day_start + 7,
+        historical_data
+    )
+
+    return sampled_window_data, year, day_start
+end
+
+# ===== 1. B) Sample a baseline year only =====
+# Alternative function to solve the model for an entire year instead of a 7-day window.
+
+function sample_baseline_year(
+    historical_data::DataFrame,
+    baseline_years::Vector{Int}
+    )
+
+    year = rand(baseline_years)
+
+    sampled_window_data = filter(row -> row.year == year, historical_data)
+
+    return sampled_window_data, year, 1
+end
+
+
+# ===== 2. Auxiliary function to pre-process the projection data =====
+# We have gathered all available and reliable estimates on how key variables will evolve by 2030. 
+# projection_deltas.csv contains those values computed as increments ("deltas")
+# with respect to the values for each of those variables for the baseline years.  
+# This function is run once and creates a dictionary with deltas and weights 
+# for each variable, avoiding having to filter the projections_delta in each iteration.
+
+function build_deltas_dictionary(
+    projection_deltas::DataFrame,
+    variables_to_draw::Vector{String},
+    year::Int
+    )
+    
+    delta_col = Symbol("delta_wrt_$(year)")
+    deltas_dictionary = Dict{String, Tuple{Vector{Float64}, Weights}}()
+
+    for var in variables_to_draw
+        subset = projection_deltas[projection_deltas.variable .== var, :]
+        deltas_dictionary[var] = (Float64.(subset[!, delta_col]), Weights(subset.weight))
+    end
+    
+    return deltas_dictionary 
+end
+
+
+
+# ===== 3. Auxiliary function to define the sampling process =====
+# In each Monte Carlo Simulation we project a randomly selected subset of the   
+# historical data ("mould") to simulate a possible realization of 2030 in Spain. 
+# This function specifies how this sampling process is done for different kinds of variables.
+
+function sampling_procedure(
+    deltas::Vector{Float64}, 
+    weights::Weights, 
+    var::String
+    )
+
+    # Define general parameters for the variables we are projecting
+    mu = mean(deltas)
+    sigma = length(deltas) == 1 ? 0.0 : std(deltas)
+
+    # For those that we do not have information, we use a small standard deviation 
+    if mu == 0 && sigma == 0
+        std_dev = 0.05
+        return rand(Normal(0.0, std_dev))
+    end
+
+    # For those that we have info but 0 spread, we treat them as deterministic (coal phase out)
+    if mu != 0 && sigma == 0
+        return mu
+    end
+
+    # For those that have small spread, we sample from a normal distribution
+    small_std_threshold = 0.05
+    if sigma < small_std_threshold
+        return rand(Normal(mu, sigma))
+
+    # For those with larger spread, we use sample from a kernel density distribution
+    else
+        # Default bandwidth is approximately 1.06 * std(data) * n^(-1/5)
+        # We'll use a smaller factor to reduce spread
+        bandwidth = 0.75 * std(deltas) * length(deltas)^(-1/5)
+        kde_est = KernelDensity.kde(deltas, weights = weights, bandwidth = bandwidth)
+        
+        # Sample from KDE by inverse transform sampling
+        x_vals = kde_est.x
+        pdf_vals = kde_est.density
+        
+        # Normalize PDF values
+        pdf_vals = pdf_vals ./ sum(pdf_vals)
+        cdf_vals = cumsum(pdf_vals)
+
+        # Sample with bounds checking
+        u = rand()
+        idx = searchsortedfirst(cdf_vals, u)
+        sampled_val = x_vals[clamp(idx, 1, length(x_vals))]
+        
+        # Further constrain extreme values such that no sample is 10% below/above the min/max data point
+        min_val = minimum(deltas) - 0.1 * abs(minimum(deltas))
+        max_val = maximum(deltas) + 0.1 * abs(maximum(deltas))
+
+        # Final safety barrier to avoid negative capacities
+        return clamp(sampled_val, max(min_val, -0.99), max_val) 
+   end
+end
+
+
+
+# ===== 4. Auxiliary function to sample a projection estimate for each variable to draw =====
+# This function applies the sampling_procedure function to each of the variables in variables_to_draw.
+# Returns another dictionary, delta draws, with the specific values to project the "mould" to 2030.
+
+function sample_deltas(
+    variables_to_draw::Vector{String},
+    deltas_dictionary::Dict{String, Tuple{Vector{Float64}, Weights}},
+    scenario::NamedTuple
+)
+    
+    delta_draws = Dict{String, Float64}()
+
+    for var in variables_to_draw
+
+        # 1. Draw provisional delta
+        deltas, weights = deltas_dictionary[var]
+        delta_draw = sampling_procedure(deltas, weights, var)
+
+        # 2. Apply scenario adjustments
+        delta_adjusted = delta_draw
+
+        # Coal phase-out
+        if var == "coal_cap_gw" && scenario.coal_phase_out
+            delta_adjusted = -1.0
+
+        # Nuclear: avoid phase-out
+        elseif var == "nuclear_cap_gw" && !scenario.nuclear_phase_out
+            delta_adjusted = 0.0        
+
+        # Batteries scaling
+        elseif var == "batteries_cap_gw"
+            delta_adjusted *= scenario.batt_cap_multiplier
+
+        # Renewables scaling 
+        elseif occursin("_cap_gw", var) && startswith(var, "ren")
+            delta_adjusted *= scenario.ren_cap_multiplier
+        end
+
+        # 3. Store final delta
+        delta_draws[var] = delta_adjusted
+    end
+
+    # we don't have projections for PH pump capacity, but estimate a relation with PH turbination capacity
+    delta_draws["pumped_hydro_pump_cap_gw"] = 0.7 * delta_draws["pumped_hydro_turb_cap_gw"]
+
+    # Expand total demand delta to the 3 sectorial demands
+    demand_delta = delta_draws["total_national_demand_gwh"]
+    delta_draws["residential_demand_gwh"] = demand_delta
+    delta_draws["commercial_demand_gwh"]  = demand_delta
+    delta_draws["industrial_demand_gwh"]  = demand_delta
+    delete!(delta_draws, "total_national_demand_gwh")  
+
+    return delta_draws
+end
+
+
+
+# ===== 5. Auxiliary function to project the "mould" dataset to 2030  =====
+# This function projects the "mould" (sampled_window_data) to 2030 by applying
+# the sampling_procedure function to each of the variables in variables_to_draw.
+# Returns the "hypothetical 2030 realization" to input into the model in each iteration.
+# The ! at the end of the name is a Julia convention to signal that some of the arguments will be modified
+
+function apply_deltas!(
+    sampled_window_data::DataFrame,
+    delta_draws::Dict{String, Float64},
+    scenario::NamedTuple
+    )
+    for (var, delta) in delta_draws
+        sampled_window_data[!, var] .*= (1 + delta)
+    end
+
+    # Climate change scenario increases cooling demand and reduces heating demand
+    if scenario.climate_demand
+        climate_multipliers = [0.98, 0.98, 0.99, 1.01, 1.03, 1.06, 1.10, 1.10, 1.06, 1.03, 0.99, 0.98]
+        for t in 1:nrow(sampled_window_data)
+            m = sampled_window_data.month[t]
+            sampled_window_data.residential_demand_gwh[t] *= climate_multipliers[m]
+            sampled_window_data.commercial_demand_gwh[t]  *= climate_multipliers[m]
+        end
+    end
+
+end
+
+# ===== 6. Auxiliary function to define iteration-specific parameters =====
+# Since the model is designed to be solved for many possible realizations of the future,
+# some parameters shall be computed for each iteration (the input data will be different in each one).
+# That is exactly what this function does, and returns a named tuple which is inputed into the model
+
+function compute_iteration_params(;
+    projected::DataFrame,        # hourly projected data for 2030
+    technology::DataFrame,       # fixed technical and economic parameters by generation technology
+    technical::NamedTuple,       # technical parameters shared across scenarios
+    scenario::NamedTuple,        # scenario-specific parameters
+   )
+
+    T = nrow(projected)
+
+    # Set minimum price to be 0.5 such that demand functions are well defined
+    projected.spot_price_eur_mwh .= ifelse.(projected.spot_price_eur_mwh .<= 0.5, 0.5, projected.spot_price_eur_mwh)
+
+    # Parameters defining domestic demand functions are re-computed in each simulation
+    b_residential = technical.elas_residential * scenario.elas_anomaly * projected.residential_demand_gwh ./ (projected.spot_price_eur_mwh * 1000)  
+    b_commercial  = technical.elas_commercial  * scenario.elas_anomaly * projected.commercial_demand_gwh  ./ (projected.spot_price_eur_mwh * 1000) 
+    b_industrial  = technical.elas_industrial  * scenario.elas_anomaly * projected.industrial_demand_gwh  ./ (projected.spot_price_eur_mwh * 1000) 
+
+    a_residential = projected.residential_demand_gwh + b_residential .* (projected.spot_price_eur_mwh * 1000) 
+    a_commercial  = projected.commercial_demand_gwh  + b_commercial  .* (projected.spot_price_eur_mwh * 1000) 
+    a_industrial  = projected.industrial_demand_gwh  + b_industrial  .* (projected.spot_price_eur_mwh * 1000) 
+
+    # average capacity to compute fixed costs
+    tech_to_var = Dict(
+        "coal"               => "coal_cap_gw",
+        "combined_cycle"     => "combined_cycle_cap_gw",
+        "gas_turbine"        => "gas_turbine_cap_gw",
+        "vapor_turbine"      => "vapor_turbine_cap_gw",
+        "cogeneration"       => "cogeneration_cap_gw",
+        "diesel"             => "diesel_cap_gw",
+        "nonrenewable_waste" => "nonrenewable_waste_cap_gw",
+        "nuclear"            => "nuclear_cap_gw",
+        "conventional_hydro" => "conventional_hydro_cap_gw",
+        "run_of_river_hydro" => "run_of_river_hydro_cap_gw",
+        "solar_pv"           => "solar_pv_cap_gw",
+        "solar_thermal"      => "solar_thermal_cap_gw",
+        "wind"               => "wind_cap_gw",
+        "other_renewable"    => "other_renewable_cap_gw",
+        "renewable_waste"    => "renewable_waste_cap_gw",
+        "pumped_hydro"       => "pumped_hydro_turb_cap_gw",
+        "battery"            => "batteries_cap_gw"
+    )
+
+    avg_cap_year = [
+        mean(projected[!, tech_to_var[tech]])
+        for tech in technology.technology
+    ]
+
+    # Hydro bundles for weekly allocation maximization
+    bundle_size = 168   # number of hours in a week
+    total_hours = nrow(projected)
+    n_bundles   = div(total_hours, bundle_size)
+    remainder   = mod(total_hours, bundle_size)
+
+    starts  = [1 + (w - 1) * bundle_size for w in 1:n_bundles]
+    bundles = [s:s + bundle_size - 1 for s in starts]
+
+    if remainder > 0
+        bundles[end] = bundles[end].start : total_hours
+    end 
+
+    hydro_min_weekly = [minimum(projected.conventional_hydro_gen_gwh[b]) for b in bundles]
+    hydro_max_weekly = [maximum(projected.conventional_hydro_gen_gwh[b]) for b in bundles]
+
+    hydro_min_hourly = zeros(Float64, total_hours)
+    hydro_max_hourly = zeros(Float64, total_hours)
+
+    for (w, b) in enumerate(bundles)
+        hydro_min_hourly[b] .= hydro_min_weekly[w]
+        hydro_max_hourly[b] .= hydro_max_weekly[w]
+    end
+
+    hydro_weekly_totals = [sum(projected.conventional_hydro_gen_gwh[b]) for b in bundles]
+
+    # Run of river hydro: hour indices by seasonal production group
+    hours_high_ror     = [t for t in 1:T if projected.month[t] in (1, 2, 12)]
+    hours_med_high_ror = [t for t in 1:T if projected.month[t] in (3, 4, 5, 6)]
+    hours_med_low_ror  = [t for t in 1:T if projected.month[t] in (7, 11)]
+    hours_low_ror      = [t for t in 1:T if projected.month[t] in (8, 9, 10)]
+
+    return (;
+        a_residential, b_residential,
+        a_commercial,  b_commercial,
+        a_industrial,  b_industrial,
+        avg_cap_year,
+        n_bundles, bundles,
+        hydro_min_hourly, hydro_max_hourly, hydro_weekly_totals,
+        hours_high_ror, hours_med_high_ror, hours_med_low_ror, hours_low_ror
+    )
+
+end
+
+
+# ===== 7. Auxiliary function to compute hourly or monthly averages of key results =====
+# we are interested in studying the hourly/monthly profile of some key variables
+# so we will compute hourly averages for each iteration on these variables
+
+function calculate_period_averages(
+    data::Vector{Float64},
+    period_index::Vector{Int},   
+    n_periods::Int               
+    )
+
+    return [mean(data[findall(period_index .== p)]) for p in 1:n_periods]
+end
+
+
+# ===== 8. Auxiliary function to store results of each iteration =====
+# This function defines how we store all the results in the loop 
+
+function store_results!(;
+    iter::Int,
+    scen::String,
+    year::Int,
+    day_start::Int,
+    results::Dict,                 # the output of dispatch_electricity_market
+    delta_draws::Dict,      
+    projected_data::DataFrame,   
+    main_results::Dict,            # pre-allocated container to save main results
+    hourly_profiles::Dict,         # pre-allocated container to save hourly profiles
+    monthly_profiles::Dict,        # pre-allocated container to save monthly profiles
+    delta_draws_container::Dict,   # pre-allocated container to save the specific delta draws for each iteration 
+    inputs_realized::Dict          # pre-allocated container to save demand, capacity and costs inputed to the model in each iteration
+    )
+
+    # factor de anualización según número de filas del sample
+    annual_factor = 365.25 * 24 / nrow(projected_data)
+
+    # ----- main_results -----
+    main_results[scen][iter] = (
+        iteration = iter,
+
+        # Solver diagnostics
+        mip_gap        = results["mip_gap"],
+        solve_time     = results["solve_time"],
+        baseline_year  = year,
+        day_start      = day_start,
+
+        # Prices
+        avg_price = results["avg_price"],
+        max_price = results["max_price"],
+        min_price = results["min_price"],
+        std_price = results["std_price"],
+
+        # Total demand
+        residential_demand = sum(results["residential_demand"]) * annual_factor,
+        commercial_demand  = sum(results["commercial_demand"])  * annual_factor,
+        industrial_demand  = sum(results["industrial_demand"])  * annual_factor,
+        total_demand       = sum(results["total_demand"])       * annual_factor,
+        
+        # Total welfare
+        consumer_surplus = results["consumer_surplus"] * annual_factor,
+        producer_surplus = results["producer_surplus"] * annual_factor,
+        total_cost       = results["total_cost"]       * annual_factor,
+        net_welfare      = results["net_welfare"]      * annual_factor,
+
+        # Total generation by technology
+        coal_gen                = sum(results["coal_gen"])                * annual_factor,
+        combined_cycle_gen      = sum(results["combined_cycle_gen"])      * annual_factor,
+        gas_turbine_gen         = sum(results["gas_turbine_gen"])         * annual_factor,
+        vapor_turbine_gen       = sum(results["vapor_turbine_gen"])       * annual_factor,
+        cogeneration_gen        = sum(results["cogeneration_gen"])        * annual_factor,
+        diesel_gen              = sum(results["diesel_gen"])              * annual_factor,
+        non_renewable_waste_gen = sum(results["non_renewable_waste_gen"]) * annual_factor,
+        nuclear_gen             = sum(results["nuclear_gen"])             * annual_factor,
+        conventional_hydro_gen  = sum(results["conventional_hydro_gen"])  * annual_factor,
+        run_of_river_hydro_gen  = sum(results["run_of_river_hydro_gen"])  * annual_factor,
+        solar_pv_gen            = sum(results["solar_pv_gen"])            * annual_factor,
+        solar_thermal_gen       = sum(results["solar_thermal_gen"])       * annual_factor,
+        wind_gen                = sum(results["wind_gen"])                * annual_factor,
+        other_renewable_gen     = sum(results["other_renewable_gen"])     * annual_factor,
+        renewable_waste_gen     = sum(results["renewable_waste_gen"])     * annual_factor,
+
+        # Total storage flows
+        pumped_hydro_pumping = sum(results["pumped_hydro_pumping"]) * annual_factor,
+        pumped_hydro_out     = sum(results["pumped_hydro_out"])     * annual_factor,
+        battery_charge       = sum(results["battery_charge"])       * annual_factor,
+        battery_out          = sum(results["battery_out"])          * annual_factor,
+
+        # Initial, average and maximum storage stock
+        initial_ph_stock   = first(results["pumped_hydro_storage"]),
+        initial_batt_stock = first(results["battery_storage"]),
+        mean_ph_stock      = mean(results["pumped_hydro_storage"]),
+        mean_batt_stock    = mean(results["battery_storage"]),
+        max_ph_stock       = maximum(results["pumped_hydro_storage"]),
+        max_batt_stock     = maximum(results["battery_storage"]),
+
+        # Aggregated total generation
+        total_generation  = sum(results["total_generation"])  * annual_factor,
+        renewable_gen     = sum(results["renewable_gen"])     * annual_factor,
+        low_carbon_gen    = sum(results["low_carbon_gen"])    * annual_factor,
+        non_renewable_gen = sum(results["non_renewable_gen"]) * annual_factor,
+        storage_out       = sum(results["storage_out"])       * annual_factor,
+
+        # Statistical measures of aggregated generation
+        share_renewable_gen  = sum(results["renewable_gen"])         / sum(results["total_generation"]),
+        share_low_carbon_gen = sum(results["low_carbon_gen"])        / sum(results["total_generation"]),
+        share_storage_out    = sum(results["storage_out"])           / sum(results["total_generation"]),
+        share_min_non_ren    = sum(results["min_non_renewable_gen"]) / sum(results["total_generation"]),
+        min_share_ren        = minimum(results["share_renewable_gen"]),
+        max_share_ren        = maximum(results["share_renewable_gen"]),
+
+        # Curtailment
+        curt_solar_pv      = 1.0 - sum(results["solar_pv_gen"])      / (sum(results["solar_pv_gen"])      + sum(results["curtailment_solar_pv"])),
+        curt_solar_thermal = 1.0 - sum(results["solar_thermal_gen"]) / (sum(results["solar_thermal_gen"]) + sum(results["curtailment_solar_thermal"])),
+        curt_wind          = 1.0 - sum(results["wind_gen"])          / (sum(results["wind_gen"])          + sum(results["curtailment_wind"])),
+
+        # System risk
+        load_shedding = sum(results["load_shedding"]) * annual_factor,
+        total_ens     = results["total_ens"]          * annual_factor,
+        lole_hours    = results["lole_hours"]         * annual_factor,
+
+        # Imports / exports
+        imports_FRA = sum(results["imports_FRA"]) * annual_factor,
+        imports_POR = sum(results["imports_POR"]) * annual_factor,
+        imports_MOR = sum(results["imports_MOR"]) * annual_factor,
+        exports_FRA = sum(results["exports_FRA"]) * annual_factor,
+        exports_POR = sum(results["exports_POR"]) * annual_factor,
+        exports_MOR = sum(results["exports_MOR"]) * annual_factor,
+
+        # Emissions
+        direct_emissions = sum(results["direct_emissions"])
+    )
+
+    # ----- hourly_profiles -----
+    projected_hour = projected_data.hour
+    hourly_avgs = Dict(k => calculate_period_averages(results[k], projected_hour,  24) for k in profile_vars)
+
+    for h in 1:24
+        push!(hourly_profiles[scen], (
+            iteration   = iter,
+            hour        = h,
+            price       = hourly_avgs["price"][h],
+            solar_pv    = hourly_avgs["solar_pv_gen"][h],
+            wind        = hourly_avgs["wind_gen"][h],
+            nuclear     = hourly_avgs["nuclear_gen"][h],
+            conv_hydro  = hourly_avgs["conventional_hydro_gen"][h],
+            ccgt        = hourly_avgs["combined_cycle_gen"][h],
+            cogen       = hourly_avgs["cogeneration_gen"][h],
+            total_gen   = hourly_avgs["total_generation"][h],
+            ren_gen     = hourly_avgs["renewable_gen"][h],
+            non_ren_gen = hourly_avgs["non_renewable_gen"][h],
+            batt_in     = hourly_avgs["battery_charge"][h],
+            batt_out    = hourly_avgs["battery_out"][h],
+            ph_in       = hourly_avgs["pumped_hydro_pumping"][h],
+            ph_out      = hourly_avgs["pumped_hydro_out"][h],
+            ren_share   = hourly_avgs["share_renewable_gen"][h],
+            lc_share    = hourly_avgs["share_low_carbon_gen"][h],
+            emissions   = hourly_avgs["direct_emissions"][h]
+        ))
+    end
+
+    # ----- monthly_profiles -----
+    projected_month = projected_data.month
+    monthly_avgs = Dict(k => calculate_period_averages(results[k], projected_month, 12) for k in profile_vars)
+
+    for m in 1:12
+        push!(monthly_profiles[scen], (
+            iteration   = iter,     
+            month       = m,
+            price       = monthly_avgs["price"][m],
+            solar_pv    = monthly_avgs["solar_pv_gen"][m],
+            wind        = monthly_avgs["wind_gen"][m],
+            nuclear     = monthly_avgs["nuclear_gen"][m],
+            conv_hydro  = monthly_avgs["conventional_hydro_gen"][m],
+            ccgt        = monthly_avgs["combined_cycle_gen"][m],
+            cogen       = monthly_avgs["cogeneration_gen"][m],
+            total_gen   = monthly_avgs["total_generation"][m],
+            ren_gen     = monthly_avgs["renewable_gen"][m],
+            non_ren_gen = monthly_avgs["non_renewable_gen"][m],
+            batt_in     = monthly_avgs["battery_charge"][m],
+            batt_out    = monthly_avgs["battery_out"][m],
+            ph_in       = monthly_avgs["pumped_hydro_pumping"][m],
+            ph_out      = monthly_avgs["pumped_hydro_out"][m],
+            ren_share   = monthly_avgs["share_renewable_gen"][m],
+            lc_share    = monthly_avgs["share_low_carbon_gen"][m],
+            emissions   = monthly_avgs["direct_emissions"][m]
+        ))
+    end
+
+    # ----- delta_draws -----
+    delta_draws_container[scen][iter] = (; (Symbol(k) => v for (k,v) in delta_draws)...)
+
+    # ----- inputs_realized -----
+    inputs_realized[scen][iter] = (
+        iteration = iter,
+
+        # Demand
+        residential_demand_gwh = mean(projected_data.residential_demand_gwh),
+        commercial_demand_gwh  = mean(projected_data.commercial_demand_gwh),
+        industrial_demand_gwh  = mean(projected_data.industrial_demand_gwh),
+
+        # Installed capacity
+        coal_cap_gw               = mean(projected_data.coal_cap_gw),
+        combined_cycle_cap_gw     = mean(projected_data.combined_cycle_cap_gw),
+        gas_turbine_cap_gw        = mean(projected_data.gas_turbine_cap_gw),
+        vapor_turbine_cap_gw      = mean(projected_data.vapor_turbine_cap_gw),
+        cogeneration_cap_gw       = mean(projected_data.cogeneration_cap_gw),
+        diesel_cap_gw             = mean(projected_data.diesel_cap_gw),
+        nonrenewable_waste_cap_gw = mean(projected_data.nonrenewable_waste_cap_gw),
+        nuclear_cap_gw            = mean(projected_data.nuclear_cap_gw),
+        conventional_hydro_cap_gw = mean(projected_data.conventional_hydro_cap_gw),
+        run_of_river_hydro_cap_gw = mean(projected_data.run_of_river_hydro_cap_gw),
+        solar_pv_cap_gw           = mean(projected_data.solar_pv_cap_gw),
+        solar_thermal_cap_gw      = mean(projected_data.solar_thermal_cap_gw),
+        wind_cap_gw               = mean(projected_data.wind_cap_gw),
+        other_renewable_cap_gw    = mean(projected_data.other_renewable_cap_gw),
+        renewable_waste_cap_gw    = mean(projected_data.renewable_waste_cap_gw),
+        pumped_hydro_turb_cap_gw  = mean(projected_data.pumped_hydro_turb_cap_gw),
+        pumped_hydro_pump_cap_gw  = mean(projected_data.pumped_hydro_pump_cap_gw),
+        batteries_cap_gw          = mean(projected_data.batteries_cap_gw),
+        
+        # Fuel and EU ETS costs
+        cost_coal_eur_gwh     = mean(projected_data.cost_coal_eur_gwh),
+        cost_gas_eur_gwh      = mean(projected_data.cost_gas_eur_gwh),
+        cost_diesel_eur_gwh   = mean(projected_data.cost_diesel_eur_gwh),
+        cost_uranium_eur_gwh  = mean(projected_data.cost_uranium_eur_gwh),
+        eu_ets_price_eur_tco2 = mean(projected_data.eu_ets_price_eur_tco2)
+    )
+
+end

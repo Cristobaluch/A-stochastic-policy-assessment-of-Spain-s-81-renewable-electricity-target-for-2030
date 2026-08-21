@@ -1,0 +1,190 @@
+# This script runs the 10,000 Monte Carlo simulations per scenario
+# scenario-specific parameters can be directly edited below (including adding new scenarios)
+
+
+# load the required libraries
+using DataFrames
+using CSV
+using Statistics
+using Distributions
+using KernelDensity
+using StatsBase
+using Printf
+
+# ===== Monte Carlo Set up =====
+
+# define project location
+project_root = dirname(@__DIR__)
+
+# load the function that models the electricity market and the other auxiliary functions
+include(joinpath(project_root, "scripts", "model_electricity_market.jl"))
+include(joinpath(project_root, "scripts", "auxiliary_functions.jl"))
+
+# load the fixed datasets
+historical_data        = CSV.read(joinpath(project_root, "data", "historical_data.csv"), DataFrame)
+technology_data        = CSV.read(joinpath(project_root, "data", "technology_data.csv"), DataFrame)
+projection_deltas_data = CSV.read(joinpath(project_root, "data", "projection_deltas_data.csv"), DataFrame)
+technical_params_df    = CSV.read(joinpath(project_root, "data", "technical_params.csv"), DataFrame)
+
+technical_params = NamedTuple(
+    Symbol(col) => technical_params_df[1, col]
+    for col in names(technical_params_df)
+)
+
+# define the scenarios
+
+scenarios = DataFrame(
+    scenario_name         = ["baseline", "nuclear", "optimistic", "climate change", "no batteries"],
+    elas_anomaly          = [1.0,        1.0,        2.0,          1.0,              1.0],
+    hydro_anomaly         = [1.0,        1.0,        1.0,          0.8,              1.0],
+    coal_phase_out        = [true,       true,       true,         true,             true],
+    nuclear_phase_out     = [true,       false,      true,         true,             true],
+    climate_demand        = [false,      false,      false,        true,             false],
+    batt_cap_multiplier   = [1.0,        0.5,        1.5,          1.0,              0.0],
+    ren_cap_multiplier    = [1.0,        0.75,       1.25,         1.0,              1.0]
+)
+
+scenario_names = scenarios.scenario_name
+
+scenario_dict = Dict(
+    scen => NamedTuple(scenarios[i, :])
+    for (i, scen) in enumerate(scenario_names)
+)
+
+# define monte carlo parameters
+baseline_years = [2020, 2021, 2022, 2023, 2024]
+
+# variables which will be scaled by the deltas drawn in each iteration, 
+variables_to_draw = [
+    "total_national_demand_gwh",  # same delta will be applied to each sectoral demand
+    "coal_cap_gw", "combined_cycle_cap_gw", "gas_turbine_cap_gw", "vapor_turbine_cap_gw", "cogeneration_cap_gw", "diesel_cap_gw", 
+    "nonrenewable_waste_cap_gw", "nuclear_cap_gw", "conventional_hydro_cap_gw", "run_of_river_hydro_cap_gw", "pumped_hydro_turb_cap_gw", 
+    "solar_pv_cap_gw", "solar_thermal_cap_gw", "wind_cap_gw", "other_renewable_cap_gw", "renewable_waste_cap_gw", "batteries_cap_gw",
+    "cost_coal_eur_gwh", "cost_gas_eur_gwh", "cost_diesel_eur_gwh", "cost_uranium_eur_gwh", "eu_ets_price_eur_tco2",
+]
+
+# define variables for which we want to compute hourly and monthly profiles 
+profile_vars = [
+    "price", 
+    "combined_cycle_gen", "cogeneration_gen", "nuclear_gen", "conventional_hydro_gen", "solar_pv_gen", "wind_gen",
+    "total_generation", "renewable_gen", "non_renewable_gen", "share_renewable_gen", "share_low_carbon_gen",
+    "battery_charge", "battery_out", "pumped_hydro_pumping", "pumped_hydro_out", 
+    "direct_emissions"
+]
+
+# run build_deltas_dictionary once to create the dictionary
+deltas_dictionary = Dict(
+    year => build_deltas_dictionary(projection_deltas_data, variables_to_draw, year)
+    for year in baseline_years
+)
+
+# define gurobi environment just once
+const GRB_ENV = Gurobi.Env()
+
+# define the directory to save the results
+detailed_dir = joinpath(project_root, "output", "detailed_results")
+
+# ===== Monte Carlo Simulation Loop =====
+
+num_iterations = 10000
+
+# define containers of results
+main_results      = Dict{String, Vector{NamedTuple}}()   
+hourly_profiles   = Dict{String, Vector{NamedTuple}}()
+monthly_profiles  = Dict{String, Vector{NamedTuple}}()
+delta_draws       = Dict{String, Vector{NamedTuple}}()
+inputs_realized   = Dict{String, Vector{NamedTuple}}()
+
+for scen in scenario_names
+    main_results[scen]     = Vector{NamedTuple}(undef, num_iterations)
+    hourly_profiles[scen]  = Vector{NamedTuple}()
+    monthly_profiles[scen] = Vector{NamedTuple}()
+    delta_draws[scen]      = Vector{NamedTuple}(undef, num_iterations)
+    inputs_realized[scen]  = Vector{NamedTuple}(undef, num_iterations)
+end
+
+for scen in scenario_names
+
+    # define scenario-specific parameters
+    scenario_params = scenario_dict[scen]  
+
+    for iter in 1:num_iterations
+
+        @printf("\nScenario %s, iteration %d of %d\n", scen, iter, num_iterations)
+
+        # 1. Sample time window from historical data
+        sampled_window_data, year, day_start = sample_time_window(historical_data, baseline_years)
+        @printf("Solving for baseline year %d with start day %d\n", year, day_start)
+
+        # in case we solve for the entire year, we leave day_start, fixed to 1 to avoid changing too many things downstream.
+        # sampled_window_data, year, day_start = sample_baseline_year(historical_data, baseline_years)
+
+        # 2. Sample deltas for this iteration
+        delta_draws_iter = sample_deltas(
+            variables_to_draw,       # vector of variables to be scaled
+            deltas_dictionary[year], # dictionary with projection deltas per variable to draw
+            scenario_params,         # scenario-specific parameters with specific rules to modify some of the delta draws
+            )
+
+        # 3. Apply deltas to the sampled data
+        apply_deltas!(sampled_window_data, delta_draws_iter, scenario_params)
+
+        # 4. Compute iteration-specific parameters
+        iteration_params = compute_iteration_params(
+            projected  = sampled_window_data,    # hourly projected data for 2030
+            technology = technology_data,        # fixed technical and economic parameters by generation technology
+            technical  = technical_params,       # model calibration parameters shared across scenarios
+            scenario   = scenario_params         # scenario-specific parameters
+            )
+
+        # 5. Solve the model
+        results = dispatch_electricity_market(
+            projected  = sampled_window_data,    # hourly projected data for 2030
+            technology = technology_data,        # fixed technical and economic parameters by generation technology
+            technical  = technical_params,       # model calibration parameters shared across scenarios
+            scenario   = scenario_params,        # scenario-specific parameters
+            iteration  = iteration_params        # iteration-specific parameters
+            )
+
+        # 6. Store all the results 
+        store_results!(
+            # these are the id of each iteration run 
+            scen      = scen, 
+            iter      = iter,
+            year      = year,
+            day_start = day_start,
+
+            # these are the parameters needed to run the function
+            results        = results, 
+            projected_data = sampled_window_data, 
+            delta_draws    = delta_draws_iter,
+
+            # these are the pre-allocated containers that are updated by the function
+            main_results          = main_results, 
+            hourly_profiles       = hourly_profiles, 
+            monthly_profiles      = monthly_profiles,
+            delta_draws_container = delta_draws, 
+            inputs_realized       = inputs_realized
+            )
+
+        # 7. Save results
+        # Checkpoint every 1000 iterations
+        if iter % 1000 == 0
+            @printf("Checkpoint at %s, iter %d\n", scen, iter)
+            CSV.write(joinpath(detailed_dir, "$(scen)_main_results.csv"),     DataFrame(main_results[scen][1:iter]))
+            CSV.write(joinpath(detailed_dir, "$(scen)_hourly_profiles.csv"),  hourly_profiles[scen])
+            CSV.write(joinpath(detailed_dir, "$(scen)_monthly_profiles.csv"), monthly_profiles[scen])
+            CSV.write(joinpath(detailed_dir, "$(scen)_delta_draws.csv"),      DataFrame(delta_draws[scen][1:iter]))
+            CSV.write(joinpath(detailed_dir, "$(scen)_inputs_realized.csv"),  DataFrame(inputs_realized[scen][1:iter]))
+        end
+
+    end
+
+    # When finishing every scenario, final save
+    CSV.write(joinpath(detailed_dir, "$(scen)_main_results.csv"),     DataFrame(main_results[scen]))
+    CSV.write(joinpath(detailed_dir, "$(scen)_hourly_profiles.csv"),  hourly_profiles[scen])
+    CSV.write(joinpath(detailed_dir, "$(scen)_monthly_profiles.csv"), monthly_profiles[scen])
+    CSV.write(joinpath(detailed_dir, "$(scen)_delta_draws.csv"),      DataFrame(delta_draws[scen]))
+    CSV.write(joinpath(detailed_dir, "$(scen)_inputs_realized.csv"),  DataFrame(inputs_realized[scen]))
+
+end
